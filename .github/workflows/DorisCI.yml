@@ -1,0 +1,571 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+---
+name: Doris CI
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+jobs:
+  latest-code-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Add remote and fetch main branch
+        run: |
+          git remote add upstream https://github.com/apache/doris.git
+          git fetch upstream master
+
+      - name: Check if code includes latest code of master branch
+        run: |
+          if git merge-base --is-ancestor upstream/master HEAD; then
+             echo "Your branch is up-to-date with master"
+          else
+             echo "Your branch is behind master, please rebase your branch with master"
+             exit 1
+          fi
+  java-checkstyle:
+    name: "CheckStyle"
+    needs: latest-code-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Paths Filter
+        uses: ./.github/actions/paths-filter
+        id: filter
+        with:
+          filters: |
+            fe_changes:
+              - 'fe/**'
+              - 'gensrc/proto/**'
+              - 'gensrc/thrift/**'
+
+      - name: Setup Maven Action
+        if: steps.filter.outputs.fe_changes == 'true'
+        uses: ./.github/actions/setup-maven
+        with:
+          maven-version: 3.8.4
+
+      - name: Run java checkstyle
+        if: steps.filter.outputs.fe_changes == 'true'
+        run:
+          cd fe && mvn clean checkstyle:check
+  clang-format:
+    name: "Clang Formatter"
+    needs: latest-code-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Paths filter
+        uses: ./.github/actions/paths-filter
+        id: filter
+        with:
+          filters: |
+            be_changes:
+              - 'be/src/**'
+              - 'be/test/**'
+
+      - name: "Format it!"
+        if: ${{ steps.filter.outputs.be_changes == 'true' }}
+        uses: ./.github/actions/clang-format-lint-action
+        id: be_clang_format
+        with:
+          source: "be/src be/test"
+          clangFormatVersion: 16
+          inplace: False
+
+      - name: Ignore it!
+        if: ${{ steps.filter.outputs.be_changes == 'false' }}
+        run: echo 'No need to check.'
+  run-ut:
+    name: BE UT (Clang)
+    needs: clang-format
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout easimon/maximize-build-space
+        run: |
+          git clone -b v7 https://github.com/easimon/maximize-build-space
+
+      - name: Maximize build space
+        uses: ./maximize-build-space
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Paths Filter
+        if: ${{ github.event_name != 'schedule' }}
+        uses: ./.github/actions/paths-filter
+        id: filter
+        with:
+          filters: |
+            be_changes:
+              - 'be/**'
+              - 'gensrc/proto/**'
+              - 'gensrc/thrift/**'
+
+      - name: Ccache ${{ github.ref }}
+        if: ${{ github.event_name == 'schedule' || steps.filter.outputs.be_changes == 'true' }}
+        uses: ./.github/actions/ccache-action
+        with:
+          key: BE-UT-Clang
+          max-size: "2G"
+          restore-keys: BE-UT-Clang-
+
+      - name: Run UT ${{ github.ref }}
+        if: ${{ github.event_name == 'schedule' || steps.filter.outputs.be_changes == 'true' }}
+        run: |
+          export DEFAULT_DIR='/opt/doris'
+
+          mkdir "${DEFAULT_DIR}"
+          wget https://github.com/amosbird/ldb_toolchain_gen/releases/download/v0.18/ldb_toolchain_gen.sh \
+            -q -O /tmp/ldb_toolchain_gen.sh
+          bash /tmp/ldb_toolchain_gen.sh "${DEFAULT_DIR}/ldb-toolchain"
+          rm /tmp/ldb_toolchain_gen.sh
+
+          sudo apt update
+          sudo DEBIAN_FRONTEND=noninteractive apt install --yes tzdata byacc
+
+          # set timezone
+          sudo ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          sudo dpkg-reconfigure --frontend noninteractive tzdata
+
+          pushd thirdparty
+          branch="${{ github.base_ref }}"
+          if [[ -z "${branch}" ]] || [[ "${branch}" == 'master' ]]; then
+            curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-prebuilt-linux-x86_64.tar.xz \
+              -o - | tar -Jxf -
+          else
+            curl -L "https://github.com/apache/doris-thirdparty/releases/download/automation-${branch/branch-/}/doris-thirdparty-prebuilt-linux-x86_64.tar.xz" \
+              -o - | tar -Jxf -
+          fi
+          popd
+
+          export PATH="${DEFAULT_DIR}/ldb-toolchain/bin/:$(pwd)/thirdparty/installed/bin/:${PATH}"
+          DORIS_TOOLCHAIN=clang ./run-be-ut.sh -j "$(nproc)" --clean --run --filter=-CGroupUtilTest.*
+  run-ut-macos:
+    name: BE UT (macOS)
+    needs: clang-format
+    runs-on: macos-12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Paths Filter
+        if: ${{ github.event_name != 'schedule' }}
+        uses: ./.github/actions/paths-filter
+        id: filter
+        with:
+          filters: |
+            be_changes:
+              - 'be/**'
+              - 'gensrc/proto/**'
+              - 'gensrc/thrift/**'
+
+      - name: Ccache ${{ github.ref }}
+        if: ${{ github.event_name == 'schedule' || steps.filter.outputs.be_changes == 'true' }}
+        uses: ./.github/actions/ccache-action
+        with:
+          key: BE-UT-macOS
+          max-size: "2G"
+          restore-keys: BE-UT-macOS-
+
+      - name: Run UT ${{ github.ref }}
+        if: ${{ github.event_name == 'schedule' || steps.filter.outputs.be_changes == 'true' }}
+        run: |
+          cellars=(
+            'automake'
+            'autoconf'
+            'libtool'
+            'pkg-config'
+            'texinfo'
+            'coreutils'
+            'gnu-getopt'
+            'python@3'
+            'cmake'
+            'ninja'
+            'ccache'
+            'bison'
+            'byacc'
+            'gettext'
+            'wget'
+            'pcre'
+            'openjdk@11'
+            'maven'
+            'node'
+            'llvm@16'
+          )
+          brew install "${cellars[@]}"
+
+          pushd thirdparty
+          branch="${{ github.base_ref }}"
+          if [[ -z "${branch}" ]] || [[ "${branch}" == 'master' ]]; then
+            curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-prebuilt-darwin-x86_64.tar.xz \
+              -o doris-thirdparty-prebuilt-darwin-x86_64.tar.xz
+          else
+            curl -L "https://github.com/apache/doris-thirdparty/releases/download/automation-${branch/branch-/}/doris-thirdparty-prebuilt-darwin-x86_64.tar.xz" \
+              -o doris-thirdparty-prebuilt-darwin-x86_64.tar.xz
+          fi
+          tar -xvf doris-thirdparty-prebuilt-darwin-x86_64.tar.xz
+          popd
+
+          ./run-be-ut.sh --run -j "$(nproc)" --clean
+  changes:
+    name: Detect Changes
+    needs: java-checkstyle
+    runs-on: ubuntu-latest
+    outputs:
+      broker_changes: ${{ steps.filter.outputs.broker_changes }}
+      docs_changes: ${{ steps.filter.outputs.docs_changes }}
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Paths filter
+        uses: ./.github/actions/paths-filter
+        id: filter
+        with:
+          filters: |
+            broker_changes:
+              - 'fs_brokers/**'
+            docs_changes:
+              - 'docs/**'
+  build-broker:
+    name: Build Broker
+    needs: changes
+    if: ${{ needs.changes.outputs.broker_changes == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v3
+
+      - name: Setup java
+        uses: actions/setup-java@v2
+        with:
+          distribution: adopt
+          java-version: '8'
+
+      - name: Setup thrift
+        run: |
+          pushd thirdparty
+          branch="${{ github.base_ref }}"
+          if [[ -z "${branch}" ]] || [[ "${branch}" == 'master' ]]; then
+            curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-prebuilt-linux-x86_64.tar.xz \
+              -o doris-thirdparty-prebuilt-linux-x86_64.tar.xz
+          else
+            curl -L "https://github.com/apache/doris-thirdparty/releases/download/automation-${branch/branch-/}/doris-thirdparty-prebuilt-linux-x86_64.tar.xz" \
+              -o doris-thirdparty-prebuilt-linux-x86_64.tar.xz
+          fi
+          tar -xvf doris-thirdparty-prebuilt-linux-x86_64.tar.xz
+          popd
+          export PATH="${DEFAULT_DIR}/ldb-toolchain/bin/:$(pwd)/thirdparty/installed/bin/:${PATH}"
+
+          thrift --version
+          # mkdir -p thirdparty/installed/bin/
+          # cd thirdparty/installed/bin/ && ln -s /usr/bin/thrift thrift
+      - name: Build broker
+        run: |
+          cd fs_brokers/apache_hdfs_broker/ && WITH_MYSQL=1 WITH_LZO=1 /bin/bash build.sh
+  build-docs:
+    name: Build Documents
+    needs: changes
+    if: ${{ needs.changes.outputs.docs_changes == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v3
+
+      - name: Build docs
+        run: |
+          cd docs && /bin/bash build_help_zip.sh
+      - name: Build
+        run: |
+          git clone https://github.com/apache/doris-website.git website
+          cd website
+          mkdir -p docs
+          cp -R ../docs/en/docs/* docs/
+          cp -R ../docs/sidebars.json sidebars.json
+          mkdir -p i18n/zh-CN/docusaurus-plugin-content-docs/current
+          cp -R ../docs/zh-CN/docs/* i18n/zh-CN/docusaurus-plugin-content-docs/current/
+          cp -R ../docs/dev.json i18n/zh-CN/docusaurus-plugin-content-docs/current.json
+
+          mkdir -p community
+          cp -R ../docs/en/community/* community/
+          mkdir -p i18n/zh-CN/docusaurus-plugin-content-docs-community/current/
+          cp -R ../docs/zh-CN/community/* i18n/zh-CN/docusaurus-plugin-content-docs-community/current/
+          cp -R ../docs/sidebarsCommunity.json .
+
+          cp -R ../docs/images static/
+          npm install -g yarn
+          yarn cache clean
+          yarn && yarn build
+          cd ../
+          rm -rf website
+  build_linux:
+    name: Build Third Party Libraries (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v3
+
+      - name: Download
+        run: |
+          cd thirdparty
+          curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-source.tgz \
+            -o doris-thirdparty-source.tgz
+          tar -zxvf doris-thirdparty-source.tgz
+
+      - name: Prepare
+        run: |
+          export DEFAULT_DIR='/opt/doris'
+          export PATH="${DEFAULT_DIR}/ldb-toolchain/bin:${PATH}"
+
+          packages=(
+            'build-essential'
+            'automake'
+            'autoconf'
+            'libtool-bin'
+            'pkg-config'
+            'cmake'
+            'ninja-build'
+            'ccache'
+            'python-is-python3'
+            'bison'
+            'byacc'
+            'flex'
+            'binutils-dev'
+            'libiberty-dev'
+            'curl'
+            'git'
+            'zip'
+            'unzip'
+            'autopoint'
+            'openjdk-8-jdk'
+            'openjdk-8-jdk-headless'
+            'maven'
+          )
+
+          sudo apt update
+          sudo DEBIAN_FRONTEND=noninteractive apt install --yes "${packages[@]}"
+
+          mkdir -p "${DEFAULT_DIR}"
+          wget https://github.com/amosbird/ldb_toolchain_gen/releases/download/v0.18/ldb_toolchain_gen.sh \
+            -q -O /tmp/ldb_toolchain_gen.sh
+          bash /tmp/ldb_toolchain_gen.sh "${DEFAULT_DIR}/ldb-toolchain"
+
+      - name: Build
+        run: |
+          export DEFAULT_DIR='/opt/doris'
+          export PATH="${DEFAULT_DIR}/ldb-toolchain/bin:${PATH}"
+          export PATH="$(find /usr/lib/jvm/java-8-openjdk* -maxdepth 1 -type d -name 'bin'):${PATH}"
+          export JAVA_HOME="$(find /usr/lib/jvm/java-8-openjdk* -maxdepth 0)"
+          export DORIS_TOOLCHAIN=gcc
+
+          cd thirdparty
+          ./build-thirdparty.sh -j "$(nproc)"
+
+  build_macos:
+    name: Build Third Party Libraries (macOS)
+    needs: changes
+    if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
+    runs-on: macos-12
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v3
+
+      - name: Download
+        run: |
+          cd thirdparty
+          curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-source.tgz \
+            -o doris-thirdparty-source.tgz
+          tar -zxvf doris-thirdparty-source.tgz
+
+      - name: Prepare
+        run: |
+          packages=(
+            'automake'
+            'autoconf'
+            'libtool'
+            'pkg-config'
+            'texinfo'
+            'coreutils'
+            'gnu-getopt'
+            'python@3'
+            'cmake'
+            'ninja'
+            'ccache'
+            'bison'
+            'byacc'
+            'gettext'
+            'wget'
+            'pcre'
+            'openjdk@11'
+            'maven'
+            'node'
+            'llvm@16'
+          )
+
+          brew install "${packages[@]}"
+
+      - name: Build
+        run: |
+          cd thirdparty
+          ./build-thirdparty.sh -j "$(nproc)"
+  run_teamcity_pipeline:
+    needs: [run-ut, run-ut-macos]
+    if: (contains(github.event.comment.body, 'buildall') || contains(github.event.comment.body, 'p0') || contains(github.event.comment.body, 'nereids_p0') || contains(github.event.comment.body, 'p1') || contains(github.event.comment.body, 'feut') || contains(github.event.comment.body, 'beut') || contains(github.event.comment.body, 'compile') || contains(github.event.comment.body, 'clickbench') || contains(github.event.comment.body, 'arm') || contains(github.event.comment.body, 'external') || contains(github.event.comment.body, 'just_for_test')) && contains(github.event.comment.body, 'run') && !contains(github.event.comment.body, 'Thanks for your contribution')
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ISSUE_COMMENT: ${{ github.event.comment.body }}
+      PULL_REQUEST_NUM: $(echo "${{ github.event.issue.pull_request.url }}" | awk -F/ '{print $NF}')
+      LATEST_COMMIT: $(curl -H "Authorization:Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/pulls/$(echo '${{ github.event.issue.pull_request.url }}' | awk -F/ '{print $NF}')" > pr_details.json && jq -r '.head.sha' pr_details.json)
+      TEAMCITY_URL: '-H \"Content-Type:text/plain\" -H \"Accept: application/json\" -u OneMoreChance:OneMoreChance http://43.132.222.7:8111'
+    steps:
+      - name: Run pipeline by teamcity restful
+        run: |
+          if [ "_xx""${{ github.event.issue.pull_request.url }}" != "_xx" ]; then
+            echo "Comment was made on pull request: $(echo ${{ github.event.issue.pull_request.url }} | awk -F/ '{print $NF}')"
+          else
+            echo "Comment was made on an issue, not a pull request."
+          fi
+          pull_request_num=${{ env.PULL_REQUEST_NUM }}
+          encoded_string=$(perl -MURI::Escape -e 'print uri_escape($ARGV[0]);' "$ISSUE_COMMENT")
+          comment_message="$ISSUE_COMMENT"
+          latest_commit_id="${{ env.LATEST_COMMIT }}"
+          teamcity_url="${{ env.TEAMCITY_URL }}"
+          trigger_pipelines=""
+          same_build_sign="false"
+          echo "pull_request_num : ${pull_request_num}"
+          echo "encoded_string : ${encoded_string}"
+          echo "latest_commit_id : ${{ env.LATEST_COMMIT }}"
+
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "buildall" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_Doris_FeUt Doris_DorisBeUt_BeUt Doris_DorisCompile_Compile Doris_Benchmark_Clickbench Doris_ArmPipeline_P0Regression ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && ( "${comment_message}" =~ "p0" || "${comment_message}" =~ "external" ) && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisRegression_P0Regression  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "nereids_p0" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisRegression_NereidsP0Regression  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "p1" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisRegression_P1Regression  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "feut" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_Doris_FeUt  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "beut" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisBeUt_BeUt  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "compile" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisCompile_Compile  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "clickbench" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_Benchmark_Clickbench  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "arm" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_ArmPipeline_P0Regression  ${trigger_pipelines}"
+          fi
+          if [[ "${comment_message}" =~ "run" && "${comment_message}" =~ "just_for_test" && ! "${comment_message}" =~ "Thanks for your contribution" ]]; then
+            trigger_pipelines="Doris_DorisRegression_ExternalRegression  ${trigger_pipelines}"
+          fi
+
+          if [ -z "${trigger_pipelines}" ];then
+            echo "Just a general comment that doesn't match any pipeline rules"
+          fi
+
+          echo "need run pipelines: ${trigger_pipelines}"
+
+          for pipeline in ${trigger_pipelines}
+          do
+            echo "-----------------------------------------------------------------"
+            running_builds_command="curl -s -X GET ${teamcity_url}/app/rest/builds\?locator\=buildType\:${pipeline}\,branch:pull/${pull_request_num}\,running:true"
+            echo "${running_builds_command}" 
+            running_builds_list=$(eval "${running_builds_command}" > running_builds.json && jq -r '.build[].id' running_builds.json)
+            echo "running_builds_list : ${running_builds_list}"
+
+            queue_builds_command="curl -s -X GET ${teamcity_url}/app/rest/buildQueue\?locator\=buildType\:${pipeline}"
+            echo "${queue_builds_command}"
+            eval "${queue_builds_command}" > queue_builds.json
+            queue_builds_list=$(cat queue_builds.json | jq ".build[] | select(.branchName == \"pull/${pull_request_num}\") | .id" )
+            echo "queue builds list: ${queue_builds_list}"
+
+            merged_list=("${running_builds_list[@]} ${queue_builds_list[@]}")
+            echo "merged_list :  ${merged_list}"
+
+            for build in ${merged_list}; do
+              running_commit_command="curl -s -X GET ${teamcity_url}/app/rest/builds/${build}"
+              echo "${running_commit_command}"
+              eval "${running_commit_command}" > build_commit_info.json
+              running_commit_id=$(jq -r '.revisions.revision[0].version' build_commit_info.json)
+              running_env_commit_id=$(cat build_commit_info.json | jq ".properties.property[] | select(.name == \"env.latest_commit_id\") | .value")
+
+              if [[ "_"${latest_commit_id} == "_"${running_commit_id} || _"\"${latest_commit_id}\"" == "_"${running_env_commit_id} ]];then
+                echo "the same pr_commit build already exist, this build ${build} is running or in queue!"
+                same_build_sign="true" 
+                break
+              fi
+            done
+
+            if [ "_""${same_build_sign}" == "_false" ];then
+              sleep 10s
+              echo "there is no running build or queue build, so trigger a new !"
+              execute_command="curl -s -X POST ${teamcity_url}/httpAuth/action.html\?add2Queue\=${pipeline}\&branchName\=pull/${pull_request_num}\&name=env.latest_pr_comment\&value=${encoded_string}\&name=env.latest_commit_id\&value=${latest_commit_id}"
+              echo "${execute_command}"
+              eval "${execute_command}"
+              echo "-----------------------------------------------------------------"
+            else 
+              echo "there is same pr commit task in queue,so skip trigger !"
+              echo "-----------------------------------------------------------------"
+            fi
+          done
